@@ -1,6 +1,6 @@
 # Hermes Memory Plugin — MuninnDB
 
-A [Hermes Agent](https://github.com/nousresearch/hermes-agent) memory plugin that provides cross-session semantic memory via [MuninnDB](https://github.com/madeinoz67/muninndb) knowledge graph.
+A [Hermes Agent](https://github.com/nousresearch/hermes-agent) memory plugin that provides cross-session semantic memory via [MuninnDB](https://github.com/scrypster/muninndb) knowledge graph.
 
 ## Features
 
@@ -15,7 +15,7 @@ A [Hermes Agent](https://github.com/nousresearch/hermes-agent) memory plugin tha
 ## Prerequisites
 
 1. **Hermes Agent** installed and working
-2. **MuninnDB** server running and accessible (see [MuninnDB docs](https://github.com/madeinoz67/muninndb))
+2. **MuninnDB** server running and accessible (see [MuninnDB docs](https://github.com/scrypster/muninndb))
 3. Python `requests` library (usually already available in Hermes venv)
 
 ## Installation
