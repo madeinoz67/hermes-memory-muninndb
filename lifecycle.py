@@ -18,12 +18,15 @@ from .mcp_client import MCPClient
 
 logger = logging.getLogger(__name__)
 
-# Default skip patterns — used when not overridden by config
+# Default skip patterns — used when not overridden by config.
+# Only generic patterns that apply to all users. User-specific
+# patterns should go in skip_patterns_extra in muninndb.json.
 DEFAULT_SKIP_PATTERNS = [
-    "[System note:", "[madeinoz]", "[hermes]", "MEDIA:",
-    "test search", "test muninndb", "ive restarted",
-    "ok now we", "ok ", "yes ", "done", "perfect",
-    "how are vaults", "what about underlying",
+    "[System note:",
+    "[hermes]",
+    "MEDIA:",
+    "/test ",
+    "/debug ",
 ]
 
 
@@ -129,10 +132,15 @@ class LifecycleHooks:
         self._turn_index = 0
         self._prefetch_thread: threading.Thread | None = None
         self._sync_thread: threading.Thread | None = None
+        self._stored_obs_count = 0  # track observations stored this session
 
         # Will be set by provider
         self._session_id = ""
         self._cross_vault_recall_fn = None
+
+        # Guide cache (lazy-fetched from muninn_guide on first use)
+        self._guide_cache: str = ""
+        self._guide_fetched: bool = False
 
     # ── Cross-vault recall wiring ────────────────────────────────────────
 
@@ -142,15 +150,60 @@ class LifecycleHooks:
 
     # ── System prompt ────────────────────────────────────────────────────
 
+    @staticmethod
+    def _extract_guide_text(result: Any) -> str:
+        """Extract guide text from muninn_guide response.
+
+        Handles the three possible return shapes from MCPClient.call():
+        - dict with "text" key -> return result["text"]
+        - dict with "content" key (string) -> return result["content"]
+        - str -> return as-is
+        - anything else -> return ""
+        """
+        if isinstance(result, dict):
+            text = result.get("text", "") or result.get("content", "")
+            if isinstance(text, str):
+                return text
+        elif isinstance(result, str):
+            return result
+        return ""
+
     def system_prompt_block(self) -> str:
         if not self._client:
             return ""
+
+        # Return cached guide if already fetched successfully
+        if self._guide_fetched and self._guide_cache:
+            return self._guide_cache
+
+        # Attempt to fetch from muninn_guide (once per session)
+        if not self._guide_fetched:
+            self._guide_fetched = True  # Set BEFORE call — prevent retry storms
+            # Check circuit breaker before attempting
+            if self._circuit is None or not self._circuit.is_open:
+                try:
+                    result = self._client.call("muninn_guide", {})
+                    text = self._extract_guide_text(result)
+                    if text and text.strip():
+                        self._guide_cache = text.strip()
+                        if self._circuit is not None:
+                            self._circuit.record_success()
+                        return self._guide_cache
+                except Exception as exc:
+                    if self._circuit is not None:
+                        self._circuit.record_failure()
+                    logger.debug("MuninnDB muninn_guide fetch failed, using fallback: %s", exc)
+
+        # Fallback: return cached guide or static text
+        if self._guide_cache:
+            return self._guide_cache
+
         return (
             "[MuninnDB Memory]\n"
             "Long-term semantic memory is available via MuninnDB. "
-            "Use muninn_search to recall relevant context, muninn_remember to persist important facts, "
-            "muninn_where_left_off to resume where you left off, muninn_forget to remove stale memories, "
-            "muninn_evolve to update existing memories, muninn_status to check vault health. "
+            "Use muninn_recall to search, muninn_remember to store, "
+            "muninn_forget to remove, muninn_evolve to update, "
+            "muninn_status to check vault health. "
             "Memories are automatically synced after each turn."
         )
 
@@ -276,6 +329,7 @@ class LifecycleHooks:
                 "vault": self._vault,
             })
             self._circuit.record_success()
+            self._stored_obs_count += 1
         except Exception as exc:
             self._circuit.record_failure()
             logger.debug("MuninnDB sync_turn failed: %s", exc)
@@ -293,10 +347,63 @@ class LifecycleHooks:
         self._session_id = new_session_id
         if reset:
             self._turn_index = 0
+            self._stored_obs_count = 0
+            self._guide_fetched = False
+            self._guide_cache = ""
             with self._prefetch_lock:
                 self._prefetch_cache.clear()
 
     # ── Session end (NEW) ────────────────────────────────────────────────
+
+    def _consolidate_observations(self) -> None:
+        """Merge similar observations stored this session to prevent noise accumulation.
+
+        Runs at session boundary when enough observations were stored.
+        Uses muninn_merge to combine related observations into a single
+        consolidated memory, reducing vault noise over time.
+        """
+        if self._stored_obs_count < 3:
+            return
+        try:
+            # Find recent observations in this vault
+            result = self._client.call("muninn_recall", {
+                "context": ["recent session observations"],
+                "limit": 5,
+                "threshold": 0.2,
+                "vault": self._vault,
+            })
+            self._circuit.record_success()
+
+            memories = (
+                result.get("memories")
+                or result.get("engrams")
+                or result.get("results")
+                or []
+            )
+            obs_ids = [m["id"] for m in memories if m.get("id")]
+
+            if len(obs_ids) >= 3:
+                # Build a consolidated summary from the observations
+                summaries = []
+                for m in memories[:5]:
+                    s = m.get("summary") or m.get("content", "")
+                    if s:
+                        summaries.append(s[:150])
+                consolidated = "Session synthesis: " + " | ".join(summaries)
+
+                self._client.call("muninn_merge", {
+                    "source_ids": obs_ids,
+                    "target_content": consolidated[:1000],
+                    "vault": self._vault,
+                })
+                self._circuit.record_success()
+                logger.debug(
+                    "MuninnDB consolidated %d observations into session synthesis",
+                    len(obs_ids),
+                )
+        except Exception as exc:
+            # Consolidation is best-effort — don't fail session end
+            logger.debug("MuninnDB consolidation skipped: %s", exc)
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         """Called at session boundary (/new, /reset, session expiry).
@@ -324,6 +431,10 @@ class LifecycleHooks:
             self._circuit.record_success()
         except Exception:
             pass
+
+        # Consolidate observations stored this session to reduce noise
+        self._consolidate_observations()
+        self._stored_obs_count = 0
 
     # ── Memory write mirror ──────────────────────────────────────────────
 

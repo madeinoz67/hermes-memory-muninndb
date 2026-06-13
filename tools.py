@@ -831,9 +831,37 @@ ALL_TOOL_SCHEMAS: List[Dict[str, Any]] = [
 ]
 
 
-def get_tool_schemas() -> List[Dict[str, Any]]:
-    """Return all tool schemas for registration."""
-    return list(ALL_TOOL_SCHEMAS)
+def get_tool_schemas(priority_filter: str = "all") -> List[Dict[str, Any]]:
+    """Return tool schemas filtered by priority tier.
+
+    Args:
+        priority_filter: One of 'core', 'p0', 'p0-p1', 'p0-p2', 'all'.
+            - 'core': 3 essential tools (search, remember, entities)
+            - 'p0': core + 6 P0 lifecycle tools = 9 tools
+            - 'p0-p1': core + P0 + 14 P1 tools = 23 tools
+            - 'all' or 'p0-p2': all 33 tools (default)
+    """
+    # Tier membership defined by schema objects — ordering-independent
+    _CORE = {id(SEARCH_SCHEMA), id(REMEMBER_SCHEMA), id(ENTITIES_SCHEMA)}
+    _P0 = {id(WHERE_LEFT_OFF_SCHEMA), id(FORGET_SCHEMA), id(EVOLVE_SCHEMA),
+            id(REMEMBER_BATCH_SCHEMA), id(CONTRADICTIONS_SCHEMA), id(STATUS_SCHEMA)}
+    _P1 = {id(LINK_SCHEMA), id(MERGE_SCHEMA), id(TRAVERSE_SCHEMA), id(DECIDE_SCHEMA),
+            id(FIND_ENTITY_SCHEMA), id(ENTITY_SNAPSHOT_SCHEMA), id(ENTITY_VERSIONS_SCHEMA),
+            id(ENTITY_CLUSTERS_SCHEMA), id(SIMILAR_ENTITIES_SCHEMA), id(MERGE_ENTITY_SCHEMA),
+            id(ENTITY_STATE_SCHEMA), id(FORGET_ENTITY_SCHEMA),
+            id(CLASSIFY_SCHEMA), id(TRUST_SCHEMA), id(FEEDBACK_SCHEMA)}
+    # P2 = everything else in ALL_TOOL_SCHEMAS not in CORE/P0/P1
+
+    filter_sets = {
+        "core": _CORE,
+        "p0": _CORE | _P0,
+        "p0-p1": _CORE | _P0 | _P1,
+    }
+    allowed = filter_sets.get(priority_filter.lower().strip())
+    if allowed is None:
+        # 'all', 'p0-p2', or unknown → return everything
+        return list(ALL_TOOL_SCHEMAS)
+    return [s for s in ALL_TOOL_SCHEMAS if id(s) in allowed]
 
 
 def handle_tool_call(

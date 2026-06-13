@@ -183,6 +183,8 @@ class MuninnDBMemoryProvider(MemoryProvider):
     def shutdown(self) -> None:
         if self._hooks:
             self._hooks.shutdown()
+        if self._client:
+            self._client.close()
         self._client = None
 
     # ── Cross-vault helpers ────────────────────────────────────────────
@@ -322,7 +324,8 @@ class MuninnDBMemoryProvider(MemoryProvider):
     # ── Tools ──────────────────────────────────────────────────────────
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return _get_tool_schemas()
+        priority_filter = self._config.get("tool_priority_filter", "all")
+        return _get_tool_schemas(priority_filter=priority_filter)
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         return _handle_tool_call(
