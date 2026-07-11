@@ -19,7 +19,7 @@ Connects to a MuninnDB MCP server over streamable-http transport.
 ## Prerequisites
 
 1. **Hermes Agent** installed and working
-2. **MuninnDB MCP server** running and accessible (https://github.com/madeinoz67/muninndb)
+2. **MuninnDB MCP server** running and accessible (https://github.com/scrypster/muninndb)
 3. Python `requests` library (usually already available in Hermes venv)
 
 ## Installation
