@@ -15,7 +15,7 @@ If you are a Hermes agent reading this, follow these steps to install or update:
 ```bash
 curl -s -m 5 -X POST -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' \
-  http://10.0.0.150:8750/mcp | python3 -c "
+  http://MUNINNDB_HOST:8750/mcp | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
 tools = d.get('result', {}).get('tools', [])
@@ -44,7 +44,7 @@ Must include `type: streamable-http`:
 mcp_servers:
   muninndb:
     type: streamable-http            # ← REQUIRED — without this, 0 tools load
-    url: http://10.0.0.150:8750/mcp
+    url: http://MUNINNDB_HOST:8750/mcp
 ```
 
 ### 4. Verify memory provider config
@@ -121,7 +121,7 @@ Option A — `muninndb.json` in Hermes home:
 ```bash
 cat > ~/.hermes/muninndb.json << 'EOF'
 {
-  "mcp_url": "http://10.0.0.150:8750/mcp"
+  "mcp_url": "http://MUNINNDB_HOST:8750/mcp"
 }
 EOF
 ```
@@ -131,12 +131,12 @@ Option B — `config.yaml` mcp_servers section (preferred):
 mcp_servers:
   muninndb:
     type: streamable-http
-    url: http://10.0.0.150:8750/mcp
+    url: http://MUNINNDB_HOST:8750/mcp
 ```
 
 Option C — environment variable:
 ```bash
-export MUNINNDB_MCP_URL=http://10.0.0.150:8750/mcp
+export MUNINNDB_MCP_URL=http://MUNINNDB_HOST:8750/mcp
 ```
 
 Priority: `muninndb.json` > `config.yaml` mcp_servers > env var.
