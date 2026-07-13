@@ -1,8 +1,7 @@
 name: muninndb
-version: 2.0.0
+version: 3.0.0
 description: >
   MuninnDB — knowledge graph memory with semantic search, entity tracking,
-  hierarchical organization, enrichment pipeline, audit/debug tools, and
-  automatic turn syncing via MCP streamable-http transport.
-  Exposes 33 tools: search, remember, entities + 6 P0 lifecycle +
-  4 knowledge graph + 8 entity management + 3 quality + 9 P2 advanced tools.
+  hierarchical organization, enrichment pipeline, work-queue leases,
+  audit/debug tools, and automatic turn syncing via MCP streamable-http transport.
+  Exposes 42 tools synced with MuninnDB v0.8.0.

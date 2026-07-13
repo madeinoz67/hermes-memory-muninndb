@@ -11,8 +11,10 @@ Features:
 - Hierarchical memory organization
 - Enrichment pipeline for memory quality
 - Session-aware with vault scoping
-- 33 tools: search, remember, entities + 6 P0 lifecycle + 4 knowledge graph
-  + 8 entity management + 3 quality + 4 audit/debug + 3 hierarchical + 2 enrichment
+- 42 tools synced with MuninnDB MCP server v0.8.0 (2026-07-13):
+  3 core + 12 P0 lifecycle + 4 knowledge graph + 8 entity management
+  + 2 quality/trust + 4 enrichment + 3 audit/export/guide + 3 hierarchical
+  + 3 work-queue/lease
 
 Config (muninndb.json in HERMES_HOME):
   mcp_url                   — MuninnDB MCP endpoint (required)

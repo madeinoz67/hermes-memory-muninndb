@@ -1,5 +1,8 @@
 """Tool schemas and unified dispatch for MuninnDB plugin.
 
+Synced against MuninnDB MCP server (muninndb/internal/mcp/tools.go)
+as of 2026-07-13 — 39 registered MCP tools.
+
 All tool calls flow through handle_tool_call() which:
 1. Checks circuit breaker
 2. Injects vault automatically
@@ -20,58 +23,82 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 TOOL_NAME_MAP: Dict[str, str] = {
-    # Original tools
+    # Core (wrapper: muninn_search → muninn_recall with cross-vault)
     "muninn_search": "muninn_recall",
+    # P0 — lifecycle
     "muninn_remember": "muninn_remember",
-    "muninn_entities": "muninn_entities",
-    # P0 tools
-    "muninn_where_left_off": "muninn_where_left_off",
+    "muninn_remember_batch": "muninn_remember_batch",
+    "muninn_recall": "muninn_recall",
+    "muninn_read": "muninn_read",
     "muninn_forget": "muninn_forget",
     "muninn_evolve": "muninn_evolve",
-    "muninn_remember_batch": "muninn_remember_batch",
-    "muninn_contradictions": "muninn_contradictions",
+    "muninn_consolidate": "muninn_consolidate",
+    "muninn_restore": "muninn_restore",
+    "muninn_list_deleted": "muninn_list_deleted",
+    "muninn_state": "muninn_state",
+    "muninn_session": "muninn_session",
     "muninn_status": "muninn_status",
-    # P1 — Knowledge graph
+    "muninn_where_left_off": "muninn_where_left_off",
+    "muninn_contradictions": "muninn_contradictions",
+    # P1 — knowledge graph
     "muninn_link": "muninn_link",
-    "muninn_merge": "muninn_merge",
     "muninn_traverse": "muninn_traverse",
     "muninn_decide": "muninn_decide",
-    # P1 — Entity management
-    "muninn_find_entity": "muninn_find_entity",
-    "muninn_entity_snapshot": "muninn_entity_snapshot",
-    "muninn_entity_versions": "muninn_entity_versions",
+    "muninn_explain": "muninn_explain",
+    # P1 — entity management
+    "muninn_entities": "muninn_entities",
+    "muninn_entity": "muninn_entity",
+    "muninn_find_by_entity": "muninn_find_by_entity",
+    "muninn_entity_state": "muninn_entity_state",
+    "muninn_entity_state_batch": "muninn_entity_state_batch",
     "muninn_entity_clusters": "muninn_entity_clusters",
+    "muninn_entity_timeline": "muninn_entity_timeline",
     "muninn_similar_entities": "muninn_similar_entities",
     "muninn_merge_entity": "muninn_merge_entity",
-    "muninn_entity_state": "muninn_entity_state",
-    "muninn_forget_entity": "muninn_forget_entity",
-    # P1 — Quality assurance
-    "muninn_classify": "muninn_classify",
+    # P1 — quality / trust / feedback
     "muninn_trust": "muninn_trust",
     "muninn_feedback": "muninn_feedback",
-    # P2 — Audit & debug
-    "muninn_audit_trail": "muninn_audit_trail",
-    "muninn_debug_recall": "muninn_debug_recall",
-    "muninn_vault_health": "muninn_vault_health",
-    "muninn_export_graph": "muninn_export_graph",
-    # P2 — Hierarchical memory
-    "muninn_parent": "muninn_parent",
-    "muninn_child": "muninn_child",
-    "muninn_level": "muninn_level",
-    # P2 — Enrichment pipeline
+    # P1 — enrichment
     "muninn_get_enrichment_candidates": "muninn_get_enrichment_candidates",
+    "muninn_apply_enrichment": "muninn_apply_enrichment",
+    "muninn_retry_enrich": "muninn_retry_enrich",
     "muninn_replay_enrichment": "muninn_replay_enrichment",
+    # P2 — audit / debug / export
+    "muninn_provenance": "muninn_provenance",
+    "muninn_export_graph": "muninn_export_graph",
+    "muninn_guide": "muninn_guide",
+    # P2 — Hierarchical memory
+    "muninn_remember_tree": "muninn_remember_tree",
+    "muninn_recall_tree": "muninn_recall_tree",
+    "muninn_add_child": "muninn_add_child",
+    # P1 — Work-queue / lease (v0.8.0)
+    "muninn_compare_and_set": "muninn_compare_and_set",
+    "muninn_claim": "muninn_claim",
+    "muninn_release": "muninn_release",
 }
 
 # ---------------------------------------------------------------------------
-# Tool schemas (existing 3 + P0 6)
+# Entity type enum (single source of truth: muninndb validEntityTypes)
 # ---------------------------------------------------------------------------
+
+_ENTITY_TYPE_ENUM = [
+    "person", "organization", "location", "concept", "technology",
+    "project", "tool", "database", "service", "framework",
+    "language", "product", "event", "other",
+]
+
+# ---------------------------------------------------------------------------
+# Tool schemas — synced with muninndb/internal/mcp/tools.go
+# ---------------------------------------------------------------------------
+
+# ── Core (3) ──────────────────────────────────────────────────────────────
 
 SEARCH_SCHEMA = {
     "name": "muninn_search",
     "description": (
         "Semantic search across MuninnDB long-term memory. "
-        "Returns ranked memories with relevance scores."
+        "Returns ranked memories with relevance scores. "
+        "Wraps muninn_recall with cross-vault search."
     ),
     "parameters": {
         "type": "object",
@@ -83,6 +110,14 @@ SEARCH_SCHEMA = {
                 "enum": ["semantic", "recent", "balanced", "deep"],
                 "description": "Recall mode (default: balanced).",
             },
+            "caller": {
+                "type": "string",
+                "description": "Your ownership-lease identity ('{host}:{session}'). Leased memories owned by others are hidden; your own are returned normally.",
+            },
+            "include_leased": {
+                "type": "boolean",
+                "description": "When true, disables lease filtering so memories checked out by other owners are also returned (admin/debug). Default: false.",
+            },
         },
         "required": ["query"],
     },
@@ -90,21 +125,81 @@ SEARCH_SCHEMA = {
 
 REMEMBER_SCHEMA = {
     "name": "muninn_remember",
-    "description": "Persist a fact, preference, decision, or observation to MuninnDB long-term memory.",
+    "description": (
+        "Store a new piece of information (engram) in long-term memory. "
+        "IMPORTANT: Keep each memory atomic — one concept, decision, or fact per memory. "
+        "If a conversation covers multiple topics, use muninn_remember_batch. "
+        "TIP: Provide 'entities' and 'entity_relationships' whenever you can identify them — "
+        "this builds the knowledge graph immediately without requiring background enrichment. "
+        "NOTE: If the exact same content already exists, the existing memory ID is returned."
+    ),
     "parameters": {
         "type": "object",
         "properties": {
             "content": {"type": "string", "description": "The information to remember."},
-            "memory_type": {
+            "concept": {"type": "string", "description": "Short label for this memory."},
+            "type": {
                 "type": "string",
-                "enum": [
-                    "fact", "decision", "observation", "preference", "issue",
-                    "task", "procedure", "event", "goal", "constraint",
-                    "ephemeral", "milestone",
-                ],
-                "description": "Memory type (default: fact).",
+                "description": (
+                    "Memory type — built-in name (fact, decision, observation, preference, "
+                    "issue, task, procedure, event, goal, constraint, identity, reference) "
+                    "or free-form label (e.g. 'architectural_decision')."
+                ),
             },
-            "summary": {"type": "string", "description": "One-line summary."},
+            "type_label": {"type": "string", "description": "Explicit free-form type label."},
+            "summary": {"type": "string", "description": "One-line summary. Skips background summarization."},
+            "tags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional topic tags.",
+            },
+            "confidence": {"type": "number", "description": "Confidence score 0.0-1.0 (default 1.0)."},
+            "created_at": {"type": "string", "description": "ISO 8601 timestamp. Defaults to now."},
+            "entities": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Entity name."},
+                        "type": {"type": "string", "enum": _ENTITY_TYPE_ENUM, "description": "Entity type."},
+                    },
+                    "required": ["name", "type"],
+                },
+                "description": "Entities mentioned. Skips background entity extraction.",
+            },
+            "relationships": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "target_id": {"type": "string", "description": "ID of the target memory (ULID)."},
+                        "relation": {"type": "string", "description": "Relationship type."},
+                        "weight": {"type": "number", "description": "Association weight 0.0-1.0 (default 0.9)."},
+                    },
+                    "required": ["target_id", "relation"],
+                },
+                "description": "Relationships to existing memories.",
+            },
+            "entity_relationships": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "from_entity": {"type": "string", "description": "Source entity name."},
+                        "to_entity": {"type": "string", "description": "Target entity name."},
+                        "rel_type": {"type": "string", "description": "Relationship type (uses, depends_on, caches_with, manages, contradicts, supports, extends, implements, belongs_to)."},
+                        "weight": {"type": "number", "description": "Confidence 0.0-1.0 (default 0.9)."},
+                    },
+                    "required": ["from_entity", "to_entity", "rel_type"],
+                },
+                "description": "Typed entity-to-entity relationships for the knowledge graph.",
+            },
+            "op_id": {"type": "string", "description": "Idempotency key. Returns cached ID if receipt exists."},
+            "embedding": {
+                "type": "array",
+                "items": {"type": "number"},
+                "description": "Optional pre-computed embedding vector. Must match vault dimension.",
+            },
         },
         "required": ["content"],
     },
@@ -112,31 +207,33 @@ REMEMBER_SCHEMA = {
 
 ENTITIES_SCHEMA = {
     "name": "muninn_entities",
-    "description": "List known entities in the MuninnDB knowledge graph, sorted by mention count.",
+    "description": "List known entities in the vault, sorted by mention count. Optionally filter by state.",
     "parameters": {
         "type": "object",
         "properties": {
-            "limit": {"type": "integer", "description": "Max results (default: 20)."},
+            "limit": {"type": "integer", "description": "Max results (default: 50)."},
+            "state": {
+                "type": "string",
+                "description": "Filter by state: active, deprecated, merged, resolved.",
+            },
         },
         "required": [],
     },
 }
 
-# P0 tools
+# ── P0 — Lifecycle tools ─────────────────────────────────────────────────
 
 WHERE_LEFT_OFF_SCHEMA = {
     "name": "muninn_where_left_off",
     "description": (
-        "Session resumption tool. Returns recently accessed memories with timestamps. "
-        "Use at the start of a new session to pick up where you left off."
+        "Surface what was being worked on at the end of the last session. "
+        "Returns the most recently accessed active memories, sorted by recency. "
+        "Call at session start to orient yourself before any user queries."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "limit": {
-                "type": "integer",
-                "description": "Max recent memories to return (default: 10).",
-            },
+            "limit": {"type": "integer", "description": "Max memories (default: 10, max: 50)."},
         },
         "required": [],
     },
@@ -144,21 +241,11 @@ WHERE_LEFT_OFF_SCHEMA = {
 
 FORGET_SCHEMA = {
     "name": "muninn_forget",
-    "description": (
-        "Soft-delete a memory by ID. The memory is marked as deleted rather than "
-        "permanently removed, allowing potential recovery."
-    ),
+    "description": "Soft-delete a memory. It remains recoverable but is excluded from recall.",
     "parameters": {
         "type": "object",
         "properties": {
-            "id": {
-                "type": "string",
-                "description": "The memory ID to forget.",
-            },
-            "reason": {
-                "type": "string",
-                "description": "Optional reason for deletion.",
-            },
+            "id": {"type": "string", "description": "Memory ID to forget."},
         },
         "required": ["id"],
     },
@@ -166,35 +253,32 @@ FORGET_SCHEMA = {
 
 EVOLVE_SCHEMA = {
     "name": "muninn_evolve",
-    "description": (
-        "Update a memory's content without creating a duplicate. "
-        "Use this to refine or correct existing memories rather than storing a new version."
-    ),
+    "description": "Update a memory with new information. Creates a new version and archives the old one.",
     "parameters": {
         "type": "object",
         "properties": {
-            "id": {
+            "id": {"type": "string", "description": "ID of the memory to evolve."},
+            "new_content": {"type": "string", "description": "Updated information."},
+            "reason": {"type": "string", "description": "Why this memory is being updated."},
+            "concept": {
                 "type": "string",
-                "description": "The memory ID to update.",
+                "description": "Optional new label. Correct concepts encoding mutable state.",
             },
-            "content": {
-                "type": "string",
-                "description": "The new content for the memory.",
-            },
-            "reason": {
-                "type": "string",
-                "description": "Optional reason for the update.",
+            "embedding": {
+                "type": "array",
+                "items": {"type": "number"},
+                "description": "Optional pre-computed embedding vector for the new version.",
             },
         },
-        "required": ["id", "content"],
+        "required": ["id", "new_content", "reason"],
     },
 }
 
 REMEMBER_BATCH_SCHEMA = {
     "name": "muninn_remember_batch",
     "description": (
-        "Store multiple memories atomically. All memories are stored in a single "
-        "transaction — if any fails, none are persisted."
+        "Store multiple memories at once (max 50). More efficient than repeated muninn_remember. "
+        "Best practice: break complex topics into individual atomic memories."
     ),
     "parameters": {
         "type": "object",
@@ -204,17 +288,58 @@ REMEMBER_BATCH_SCHEMA = {
                 "items": {
                     "type": "object",
                     "properties": {
-                        "content": {"type": "string"},
-                        "type": {"type": "string"},
-                        "summary": {"type": "string"},
+                        "content": {"type": "string", "description": "The information to remember."},
+                        "concept": {"type": "string", "description": "Short label."},
+                        "type": {"type": "string", "description": "Memory type."},
+                        "type_label": {"type": "string", "description": "Free-form type label."},
+                        "summary": {"type": "string", "description": "One-line summary."},
+                        "tags": {"type": "array", "items": {"type": "string"}},
+                        "confidence": {"type": "number"},
+                        "created_at": {"type": "string"},
                         "entities": {
                             "type": "array",
-                            "items": {"type": "string"},
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "name": {"type": "string"},
+                                    "type": {"type": "string"},
+                                },
+                                "required": ["name", "type"],
+                            },
+                        },
+                        "relationships": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "target_id": {"type": "string"},
+                                    "relation": {"type": "string"},
+                                    "weight": {"type": "number"},
+                                },
+                                "required": ["target_id", "relation"],
+                            },
+                        },
+                        "entity_relationships": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "from_entity": {"type": "string"},
+                                    "to_entity": {"type": "string"},
+                                    "rel_type": {"type": "string"},
+                                    "weight": {"type": "number"},
+                                },
+                                "required": ["from_entity", "to_entity", "rel_type"],
+                            },
+                        },
+                        "embedding": {
+                            "type": "array",
+                            "items": {"type": "number"},
                         },
                     },
                     "required": ["content"],
                 },
-                "description": "Array of memories to store atomically.",
+                "description": "Array of memories to store (max 50).",
             },
         },
         "required": ["memories"],
@@ -223,28 +348,7 @@ REMEMBER_BATCH_SCHEMA = {
 
 CONTRADICTIONS_SCHEMA = {
     "name": "muninn_contradictions",
-    "description": (
-        "Find conflicting memories in the vault. Returns pairs of memories with "
-        "contradictory content for review and resolution."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "limit": {
-                "type": "integer",
-                "description": "Max contradiction pairs to return (default: 10).",
-            },
-        },
-        "required": [],
-    },
-}
-
-STATUS_SCHEMA = {
-    "name": "muninn_status",
-    "description": (
-        "Vault health summary. Returns memory count, health status, enrichment mode, "
-        "and config summary. Useful for debugging vault issues."
-    ),
+    "description": "Check for known contradictions in this vault.",
     "parameters": {
         "type": "object",
         "properties": {},
@@ -252,80 +356,148 @@ STATUS_SCHEMA = {
     },
 }
 
-# ---------------------------------------------------------------------------
-# P1 — Knowledge graph tools
-# ---------------------------------------------------------------------------
+STATUS_SCHEMA = {
+    "name": "muninn_status",
+    "description": "Get health and capacity statistics for the vault.",
+    "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+    },
+}
+
+READ_SCHEMA = {
+    "name": "muninn_read",
+    "description": (
+        "Fetch a single memory by its ID. Returns full content plus any caller-provided "
+        "entities and entity relationships stored with the memory."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "id": {"type": "string", "description": "Memory ID (ULID)."},
+        },
+        "required": ["id"],
+    },
+}
+
+CONSOLIDATE_SCHEMA = {
+    "name": "muninn_consolidate",
+    "description": "Merge multiple related memories into one. Archives the originals. Maximum 50 IDs.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "IDs of memories to merge (max 50).",
+            },
+            "merged_content": {"type": "string", "description": "Content for the consolidated memory."},
+        },
+        "required": ["ids", "merged_content"],
+    },
+}
+
+RESTORE_SCHEMA = {
+    "name": "muninn_restore",
+    "description": "Recover a soft-deleted memory within the 7-day recovery window.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "id": {"type": "string", "description": "ID of the deleted memory to restore."},
+        },
+        "required": ["id"],
+    },
+}
+
+LIST_DELETED_SCHEMA = {
+    "name": "muninn_list_deleted",
+    "description": "List soft-deleted memories still within the 7-day recovery window.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "limit": {"type": "integer", "description": "Max results (default: 20, max: 100)."},
+        },
+        "required": [],
+    },
+}
+
+STATE_SCHEMA = {
+    "name": "muninn_state",
+    "description": (
+        "Transition a memory's lifecycle state. Valid states: "
+        "planning, active, paused, blocked, completed, cancelled, archived."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "id": {"type": "string", "description": "ID of the memory to update."},
+            "state": {
+                "type": "string",
+                "enum": ["planning", "active", "paused", "blocked", "completed", "cancelled", "archived"],
+                "description": "The new lifecycle state.",
+            },
+            "reason": {"type": "string", "description": "Optional: why the state is being changed."},
+        },
+        "required": ["id", "state"],
+    },
+}
+
+SESSION_SCHEMA = {
+    "name": "muninn_session",
+    "description": "Get a summary of recent memory activity since a timestamp.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "since": {"type": "string", "description": "ISO 8601 timestamp. Return activity after this time."},
+        },
+        "required": ["since"],
+    },
+}
+
+# ── P1 — Knowledge graph tools ───────────────────────────────────────────
 
 LINK_SCHEMA = {
     "name": "muninn_link",
     "description": (
-        "Create a typed relationship between two memories. "
-        "Use to connect related memories in the knowledge graph."
+        "Create or strengthen an association between two memories. "
+        "Choose the most specific relation type: supports, contradicts, depends_on, "
+        "supersedes, relates_to, is_part_of, causes, preceded_by, followed_by, "
+        "created_by_person, belongs_to_project, references, implements, blocks, "
+        "resolves, refines."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "source_id": {
-                "type": "string",
-                "description": "Source memory ID.",
-            },
-            "target_id": {
-                "type": "string",
-                "description": "Target memory ID.",
-            },
-            "relation": {
-                "type": "string",
-                "description": "Relationship type (e.g. 'supports', 'contradicts', 'derived_from').",
-            },
+            "source_id": {"type": "string", "description": "Source memory ID."},
+            "target_id": {"type": "string", "description": "Target memory ID."},
+            "relation": {"type": "string", "description": "Relationship type."},
+            "weight": {"type": "number", "description": "Association weight 0.0-1.0 (default 0.8)."},
         },
         "required": ["source_id", "target_id", "relation"],
-    },
-}
-
-MERGE_SCHEMA = {
-    "name": "muninn_merge",
-    "description": (
-        "Consolidate fragmented observations into a single unified memory. "
-        "Source memories are marked as merged; a new memory is created."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "source_ids": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "IDs of memories to merge.",
-            },
-            "target_content": {
-                "type": "string",
-                "description": "Consolidated content for the merged memory.",
-            },
-        },
-        "required": ["source_ids", "target_content"],
     },
 }
 
 TRAVERSE_SCHEMA = {
     "name": "muninn_traverse",
     "description": (
-        "Explore the memory graph starting from a specific memory. "
-        "Returns connected memories along relationship edges."
+        "Explore the memory graph by following associations from a starting memory. "
+        "Returns nodes and edges within the specified hop distance."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "start_id": {
-                "type": "string",
-                "description": "Starting memory ID.",
+            "start_id": {"type": "string", "description": "ID of the memory to start from."},
+            "max_hops": {"type": "integer", "description": "Maximum BFS depth (default: 2, max: 5)."},
+            "max_nodes": {"type": "integer", "description": "Max memories to return (default: 20, max: 100)."},
+            "rel_types": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Filter to specific relation types.",
             },
-            "direction": {
-                "type": "string",
-                "enum": ["forward", "backward", "both"],
-                "description": "Traversal direction (default: both).",
-            },
-            "max_depth": {
-                "type": "integer",
-                "description": "Maximum traversal depth (default: 3).",
+            "follow_entities": {
+                "type": "boolean",
+                "description": "When true, BFS also traverses shared entity links (default: false).",
             },
         },
         "required": ["start_id"],
@@ -334,116 +506,186 @@ TRAVERSE_SCHEMA = {
 
 DECIDE_SCHEMA = {
     "name": "muninn_decide",
-    "description": (
-        "Record a decision with its rationale and considered alternatives. "
-        "Creates a structured decision memory for future reference."
-    ),
+    "description": "Record a decision with rationale and link it to supporting evidence.",
     "parameters": {
         "type": "object",
         "properties": {
-            "decision": {
-                "type": "string",
-                "description": "The decision that was made.",
-            },
-            "rationale": {
-                "type": "string",
-                "description": "Why this decision was made.",
-            },
+            "decision": {"type": "string", "description": "The decision made."},
+            "rationale": {"type": "string", "description": "Reasoning behind the decision."},
             "alternatives": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Alternatives that were considered but not chosen.",
+                "description": "Other options that were considered.",
+            },
+            "evidence_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Memory IDs that support this decision.",
             },
         },
         "required": ["decision", "rationale"],
     },
 }
 
-# ---------------------------------------------------------------------------
-# P1 — Entity management tools
-# ---------------------------------------------------------------------------
-
-FIND_ENTITY_SCHEMA = {
-    "name": "muninn_find_entity",
+EXPLAIN_SCHEMA = {
+    "name": "muninn_explain",
     "description": (
-        "Fast entity lookup by name. Returns entity details including "
-        "type, mention count, and associated memory count."
+        "Show the full score breakdown for why a specific memory would be returned "
+        "for a given query. Use for debugging recall quality."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "name": {
-                "type": "string",
-                "description": "Entity name to look up.",
+            "engram_id": {"type": "string", "description": "ID of the memory to score-explain."},
+            "query": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Context phrases to evaluate against.",
             },
+            "embedding": {
+                "type": "array",
+                "items": {"type": "number"},
+                "description": "Optional pre-computed query embedding vector.",
+            },
+        },
+        "required": ["engram_id", "query"],
+    },
+}
+
+# ── P1 — Entity management tools ─────────────────────────────────────────
+
+ENTITY_SCHEMA = {
+    "name": "muninn_entity",
+    "description": (
+        "Returns the full aggregate view for a named entity: metadata, "
+        "engrams mentioning it, relationships, and co-occurring entities."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "description": "Entity name (case-insensitive)."},
+            "limit": {"type": "integer", "description": "Max engrams to include (default: 20)."},
         },
         "required": ["name"],
     },
 }
 
-ENTITY_SNAPSHOT_SCHEMA = {
-    "name": "muninn_entity_snapshot",
+FIND_BY_ENTITY_SCHEMA = {
+    "name": "muninn_find_by_entity",
     "description": (
-        "Full aggregate view of an entity — the entity itself plus all "
-        "associated memories and relationships."
+        "Return all memories that mention a given named entity. "
+        "Uses the entity reverse index for fast lookup."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "name": {
-                "type": "string",
-                "description": "Entity name to snapshot.",
-            },
+            "entity_name": {"type": "string", "description": "Entity name to look up."},
+            "limit": {"type": "integer", "description": "Max results (1-50, default: 20)."},
         },
-        "required": ["name"],
+        "required": ["entity_name"],
     },
 }
 
-ENTITY_VERSIONS_SCHEMA = {
-    "name": "muninn_entity_versions",
+ENTITY_STATE_SCHEMA = {
+    "name": "muninn_entity_state",
     "description": (
-        "Track how an entity has evolved over time. Returns the version "
-        "history including changes to type, state, and metadata."
+        "Set the lifecycle state of a named entity (active, deprecated, merged, resolved) "
+        "and optionally correct its type. For state=merged, provide merged_into."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "name": {
+            "entity_name": {"type": "string", "description": "Entity name to update."},
+            "state": {
                 "type": "string",
-                "description": "Entity name to get versions for.",
+                "description": "New state: active, deprecated, merged, or resolved.",
+            },
+            "merged_into": {
+                "type": "string",
+                "description": "Canonical entity name (required when state=merged).",
+            },
+            "type": {
+                "type": "string",
+                "enum": _ENTITY_TYPE_ENUM,
+                "description": "Correct the entity type. Omit to preserve existing.",
             },
         },
-        "required": ["name"],
+        "required": ["entity_name", "state"],
+    },
+}
+
+ENTITY_STATE_BATCH_SCHEMA = {
+    "name": "muninn_entity_state_batch",
+    "description": (
+        "Update lifecycle state for multiple entities in one call (max 50). "
+        "Partial success supported — check per-item status."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "operations": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "entity_name": {"type": "string", "description": "Entity name to update."},
+                        "state": {"type": "string", "description": "New state."},
+                        "merged_into": {"type": "string", "description": "Canonical entity (state=merged)."},
+                        "type": {"type": "string", "enum": _ENTITY_TYPE_ENUM},
+                    },
+                    "required": ["entity_name", "state"],
+                },
+                "description": "Array of entity state operations (max 50).",
+            },
+        },
+        "required": ["operations"],
     },
 }
 
 ENTITY_CLUSTERS_SCHEMA = {
     "name": "muninn_entity_clusters",
     "description": (
-        "Discover implicit entity relationships via co-occurrence analysis. "
-        "Returns pairs of entities that frequently appear together."
+        "Return entity pairs that frequently co-occur in the same memories. "
+        "Useful for discovering implicit relationships."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "top_n": {
-                "type": "integer",
-                "description": "Number of top clusters to return (default: 20).",
-            },
+            "min_count": {"type": "integer", "description": "Minimum co-occurrence count (default: 2)."},
+            "top_n": {"type": "integer", "description": "Max pairs to return (default: 20)."},
         },
         "required": [],
+    },
+}
+
+ENTITY_TIMELINE_SCHEMA = {
+    "name": "muninn_entity_timeline",
+    "description": (
+        "Chronological view of when an entity first appeared and how it evolved. "
+        "Shows all engrams mentioning the entity, sorted by creation time."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "entity_name": {"type": "string", "description": "Entity name to look up."},
+            "limit": {"type": "integer", "description": "Max timeline entries (1-50, default: 10)."},
+        },
+        "required": ["entity_name"],
     },
 }
 
 SIMILAR_ENTITIES_SCHEMA = {
     "name": "muninn_similar_entities",
     "description": (
-        "Find potential duplicate entities — case variants, fuzzy matches, "
-        "and near-duplicate names. Useful for entity deduplication."
+        "Find entity names that are likely duplicates based on trigram similarity. "
+        "Use muninn_merge_entity to merge confirmed duplicates."
     ),
     "parameters": {
         "type": "object",
-        "properties": {},
+        "properties": {
+            "threshold": {"type": "number", "description": "Min similarity 0.0-1.0 (default: 0.85)."},
+            "top_n": {"type": "integer", "description": "Max pairs to return (default: 20)."},
+        },
         "required": [],
     },
 }
@@ -451,383 +693,412 @@ SIMILAR_ENTITIES_SCHEMA = {
 MERGE_ENTITY_SCHEMA = {
     "name": "muninn_merge_entity",
     "description": (
-        "Deduplicate entity names by merging a source entity into a target. "
-        "All memories and relationships from source are transferred to target."
+        "Merge entity_a into entity_b (canonical). Sets entity_a to merged state, "
+        "relinks all engrams. Use dry_run=true to preview."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "source": {
-                "type": "string",
-                "description": "Source entity name (will be merged into target).",
-            },
-            "target": {
-                "type": "string",
-                "description": "Target entity name (will absorb the source).",
-            },
+            "entity_a": {"type": "string", "description": "Entity to merge away."},
+            "entity_b": {"type": "string", "description": "Canonical entity to keep."},
+            "dry_run": {"type": "boolean", "description": "Preview without writing (default: false)."},
         },
-        "required": ["source", "target"],
+        "required": ["entity_a", "entity_b"],
     },
 }
 
-ENTITY_STATE_SCHEMA = {
-    "name": "muninn_entity_state",
-    "description": (
-        "Manage entity lifecycle state transitions. Set an entity to "
-        "active, archived, or merged state."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "name": {
-                "type": "string",
-                "description": "Entity name.",
-            },
-            "state": {
-                "type": "string",
-                "enum": ["active", "archived", "merged"],
-                "description": "New state for the entity.",
-            },
-            "type": {
-                "type": "string",
-                "description": "Optional entity type to set.",
-            },
-        },
-        "required": ["name", "state"],
-    },
-}
-
-FORGET_ENTITY_SCHEMA = {
-    "name": "muninn_forget_entity",
-    "description": (
-        "Remove an entity from the knowledge graph. Optionally cascade "
-        "to delete all associated memories."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "name": {
-                "type": "string",
-                "description": "Entity name to remove.",
-            },
-            "cascade": {
-                "type": "boolean",
-                "description": "If true, also delete all associated memories (default: false).",
-            },
-        },
-        "required": ["name"],
-    },
-}
-
-# ---------------------------------------------------------------------------
-# P1 — Quality assurance tools
-# ---------------------------------------------------------------------------
-
-CLASSIFY_SCHEMA = {
-    "name": "muninn_classify",
-    "description": (
-        "Classify a memory's confidence level. Used by the classify pipeline "
-        "to mark memories as verified, inferred, or untrusted."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "id": {
-                "type": "string",
-                "description": "Memory ID to classify.",
-            },
-            "classification": {
-                "type": "string",
-                "enum": ["verified", "inferred", "untrusted"],
-                "description": "Confidence classification.",
-            },
-        },
-        "required": ["id", "classification"],
-    },
-}
+# ── P1 — Quality / Trust / Feedback ──────────────────────────────────────
 
 TRUST_SCHEMA = {
     "name": "muninn_trust",
     "description": (
-        "Set the trust level on a memory. Marks whether the memory is "
-        "verified, inferred from context, or untrusted."
+        "Set the trust level of an engram. Levels: verified (human-confirmed), "
+        "inferred (AI-generated, default), external (imported), untrusted (unreliable)."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "id": {
+            "id": {"type": "string", "description": "ULID of the engram to update."},
+            "trust": {
                 "type": "string",
-                "description": "Memory ID.",
-            },
-            "level": {
-                "type": "string",
-                "enum": ["verified", "inferred", "untrusted"],
-                "description": "Trust level to set.",
+                "enum": ["verified", "inferred", "external", "untrusted"],
+                "description": "Trust level to assign.",
             },
         },
-        "required": ["id", "level"],
+        "required": ["id", "trust"],
     },
 }
 
 FEEDBACK_SCHEMA = {
     "name": "muninn_feedback",
-    "description": (
-        "Signal whether a recall was useful for relevance tuning. "
-        "Helps improve future search quality."
-    ),
+    "description": "Record explicit feedback on an engram. Updates learned scoring weights via SGD.",
     "parameters": {
         "type": "object",
         "properties": {
-            "query": {
-                "type": "string",
-                "description": "The original search query.",
-            },
-            "memory_ids": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "IDs of recalled memories being rated.",
-            },
-            "useful": {
-                "type": "boolean",
-                "description": "Whether the recall results were useful.",
-            },
+            "engram_id": {"type": "string", "description": "Engram ID that was retrieved."},
+            "useful": {"type": "boolean", "description": "Whether the engram was helpful (default: false)."},
         },
-        "required": ["query", "memory_ids", "useful"],
+        "required": ["engram_id"],
     },
 }
 
-# ---------------------------------------------------------------------------
-# P2 — Audit & debug tools
-# ---------------------------------------------------------------------------
-
-AUDIT_TRAIL_SCHEMA = {
-    "name": "muninn_audit_trail",
-    "description": (
-        "Change history for a memory. Returns a chronological list of all "
-        "modifications with timestamps, change types, and diff metadata."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "id": {
-                "type": "string",
-                "description": "Memory ID to get audit trail for.",
-            },
-        },
-        "required": ["id"],
-    },
-}
-
-DEBUG_RECALL_SCHEMA = {
-    "name": "muninn_debug_recall",
-    "description": (
-        "Explain why a recall returned specific results. Returns scored results "
-        "with detailed explanation metadata including matching factors and "
-        "relevance breakdown."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "query": {
-                "type": "string",
-                "description": "The query to debug (same query used in recall).",
-            },
-            "limit": {
-                "type": "integer",
-                "description": "Max results to analyze (default: 5).",
-            },
-        },
-        "required": ["query"],
-    },
-}
-
-VAULT_HEALTH_SCHEMA = {
-    "name": "muninn_vault_health",
-    "description": (
-        "Detailed health diagnostics for the vault. Returns memory count, "
-        "storage size, index health, and enrichment statistics."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {},
-        "required": [],
-    },
-}
-
-EXPORT_GRAPH_SCHEMA = {
-    "name": "muninn_export_graph",
-    "description": (
-        "Export the entity graph in structured format. Supports JSON and DOT "
-        "(Graphviz) output formats for visualization and analysis."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "format": {
-                "type": "string",
-                "enum": ["json", "dot"],
-                "description": "Output format (default: json).",
-            },
-        },
-        "required": [],
-    },
-}
-
-# ---------------------------------------------------------------------------
-# P2 — Hierarchical memory tools
-# ---------------------------------------------------------------------------
-
-PARENT_SCHEMA = {
-    "name": "muninn_parent",
-    "description": (
-        "Set a parent memory for hierarchical organization. Creates a "
-        "parent-child relationship in the memory graph."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "child_id": {
-                "type": "string",
-                "description": "ID of the child memory.",
-            },
-            "parent_id": {
-                "type": "string",
-                "description": "ID of the parent memory.",
-            },
-        },
-        "required": ["child_id", "parent_id"],
-    },
-}
-
-CHILD_SCHEMA = {
-    "name": "muninn_child",
-    "description": (
-        "Set a child memory for hierarchical organization. Creates a "
-        "parent-child relationship in the memory graph."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "parent_id": {
-                "type": "string",
-                "description": "ID of the parent memory.",
-            },
-            "child_id": {
-                "type": "string",
-                "description": "ID of the child memory.",
-            },
-        },
-        "required": ["parent_id", "child_id"],
-    },
-}
-
-LEVEL_SCHEMA = {
-    "name": "muninn_level",
-    "description": (
-        "Navigate hierarchical memory levels. Returns the parent (up) or "
-        "children (down) of a memory in the hierarchy."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "id": {
-                "type": "string",
-                "description": "Memory ID to navigate from.",
-            },
-            "direction": {
-                "type": "string",
-                "enum": ["up", "down"],
-                "description": "Navigation direction: up (parent) or down (children).",
-            },
-        },
-        "required": ["id", "direction"],
-    },
-}
-
-# ---------------------------------------------------------------------------
-# P2 — Enrichment pipeline tools
-# ---------------------------------------------------------------------------
+# ── P1 — Enrichment pipeline ─────────────────────────────────────────────
 
 GET_ENRICHMENT_CANDIDATES_SCHEMA = {
     "name": "muninn_get_enrichment_candidates",
     "description": (
-        "Find memories that are missing enrichment stages. Returns a list of "
-        "memory IDs along with which enrichment stages are incomplete."
+        "Return active memories missing one or more enrichment stages so an external "
+        "MCP agent can enrich them."
     ),
     "parameters": {
         "type": "object",
-        "properties": {},
+        "properties": {
+            "stages": {
+                "type": "array",
+                "items": {"type": "string", "enum": ["entities", "relationships", "classification", "summary"]},
+                "description": "Which stages to look for. Defaults to all four.",
+            },
+            "limit": {"type": "integer", "description": "Max candidates (default: 50, max: 200)."},
+            "cursor": {"type": "string", "description": "Pagination cursor from previous call."},
+        },
         "required": [],
+    },
+}
+
+APPLY_ENRICHMENT_SCHEMA = {
+    "name": "muninn_apply_enrichment",
+    "description": (
+        "Persist externally generated enrichment output for a single memory. "
+        "Use after an MCP agent reads candidates and generates results."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "id": {"type": "string", "description": "ID of the memory to update."},
+            "expected_updated_at": {
+                "type": "string",
+                "description": "RFC3339Nano timestamp from candidate response. Prevents stale overwrites.",
+            },
+            "summary": {"type": "string", "description": "Generated summary."},
+            "memory_type": {"type": "string", "description": "Generated memory type."},
+            "type_label": {"type": "string", "description": "Generated free-form type label."},
+            "entities": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "type": {"type": "string", "enum": _ENTITY_TYPE_ENUM},
+                        "confidence": {"type": "number"},
+                    },
+                    "required": ["name", "type"],
+                },
+                "description": "Extracted entities to persist.",
+            },
+            "relationships": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "from_entity": {"type": "string"},
+                        "to_entity": {"type": "string"},
+                        "rel_type": {"type": "string"},
+                        "weight": {"type": "number"},
+                    },
+                    "required": ["from_entity", "to_entity", "rel_type"],
+                },
+                "description": "Extracted entity relationships.",
+            },
+            "stages_completed": {
+                "type": "array",
+                "items": {"type": "string", "enum": ["entities", "relationships", "classification", "summary"]},
+                "description": "Explicit stage list to mark complete even when output is empty.",
+            },
+            "source": {"type": "string", "description": "Provenance label (default: mcp_agent)."},
+        },
+        "required": ["id", "expected_updated_at"],
+    },
+}
+
+RETRY_ENRICH_SCHEMA = {
+    "name": "muninn_retry_enrich",
+    "description": "Re-queue a memory for enrichment processing by active plugins.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "id": {"type": "string", "description": "ID of the memory to re-enrich."},
+        },
+        "required": ["id"],
     },
 }
 
 REPLAY_ENRICHMENT_SCHEMA = {
     "name": "muninn_replay_enrichment",
     "description": (
-        "Run the enrichment pipeline on specified memories. If no IDs are "
-        "provided, runs on all memories with missing enrichment stages."
+        "Re-run the enrichment pipeline for memories missing specific stages. "
+        "Supports dry_run=true to preview. Returns processed/skipped/failed/remaining counts."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "ids": {
+            "stages": {
                 "type": "array",
-                "items": {"type": "string"},
-                "description": (
-                    "Memory IDs to enrich. If omitted, enriches all "
-                    "memories with missing enrichment stages."
-                ),
+                "items": {"type": "string", "enum": ["entities", "relationships", "classification", "summary"]},
+                "description": "Which stages to re-run. Defaults to all four.",
+            },
+            "limit": {"type": "integer", "description": "Max memories to process (default: 50, max: 200)."},
+            "dry_run": {"type": "boolean", "description": "Scan only, don't enrich (default: false)."},
+        },
+        "required": [],
+    },
+}
+
+# ── P2 — Audit / Debug / Export ──────────────────────────────────────────
+
+PROVENANCE_SCHEMA = {
+    "name": "muninn_provenance",
+    "description": "Returns the ordered audit trail for an engram — who wrote it, what changed, and why.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "id": {"type": "string", "description": "Engram ID (ULID)."},
+        },
+        "required": ["id"],
+    },
+}
+
+EXPORT_GRAPH_SCHEMA = {
+    "name": "muninn_export_graph",
+    "description": (
+        "Export the entity relationship graph as JSON-LD or GraphML. "
+        "Nodes are named entities; edges are typed entity-to-entity relationships."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "format": {
+                "type": "string",
+                "enum": ["json-ld", "graphml"],
+                "description": "Output format: 'json-ld' (default) or 'graphml'.",
+            },
+            "include_engrams": {
+                "type": "boolean",
+                "description": "Enrich entity types from entity record table (default: false).",
             },
         },
         "required": [],
     },
 }
 
+GUIDE_SCHEMA = {
+    "name": "muninn_guide",
+    "description": "Get instructions on how to use MuninnDB effectively. Call on first connect.",
+    "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+    },
+}
+
+# ── P2 — Hierarchical memory tools ───────────────────────────────────────
+
+REMEMBER_TREE_SCHEMA = {
+    "name": "muninn_remember_tree",
+    "description": (
+        "Store a nested hierarchy (project plan, task tree, outline) as linked engrams. "
+        "Each node becomes a full engram. Returns root_id and node_map."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "root": {
+                "type": "object",
+                "properties": {
+                    "concept": {"type": "string", "description": "Short label."},
+                    "content": {"type": "string", "description": "Content."},
+                    "type": {"type": "string", "description": "Memory type."},
+                    "tags": {"type": "array", "items": {"type": "string"}},
+                    "children": {
+                        "type": "array",
+                        "description": "Child nodes (recursive).",
+                        "items": {"type": "object"},
+                    },
+                },
+                "required": ["concept", "content"],
+                "description": "Root node of the tree. Children are recursive.",
+            },
+        },
+        "required": ["root"],
+    },
+}
+
+RECALL_TREE_SCHEMA = {
+    "name": "muninn_recall_tree",
+    "description": (
+        "Retrieve the complete ordered hierarchy rooted at root_id. "
+        "Use after muninn_recall finds the root engram's ID."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "root_id": {"type": "string", "description": "ULID of the root engram."},
+            "max_depth": {"type": "integer", "description": "Max recursion depth. 0=unlimited (default: 10)."},
+            "limit": {"type": "integer", "description": "Max children per node. 0=no limit (default: 0)."},
+            "include_completed": {"type": "boolean", "description": "Include completed nodes (default: true)."},
+        },
+        "required": ["root_id"],
+    },
+}
+
+ADD_CHILD_SCHEMA = {
+    "name": "muninn_add_child",
+    "description": (
+        "Add a single child node to an existing parent in a tree. "
+        "Use for incremental tree updates without resending the whole tree."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "parent_id": {"type": "string", "description": "ULID of the parent engram."},
+            "concept": {"type": "string", "description": "Short label for the new child."},
+            "content": {"type": "string", "description": "Content for the new child."},
+            "type": {"type": "string", "description": "Memory type."},
+            "tags": {"type": "array", "items": {"type": "string"}},
+            "ordinal": {"type": "integer", "description": "Explicit ordinal position. Omit to append."},
+            "embedding": {
+                "type": "array",
+                "items": {"type": "number"},
+                "description": "Optional pre-computed embedding vector.",
+            },
+        },
+        "required": ["parent_id", "concept", "content"],
+    },
+}
+
+# ── P1 — Work-queue / lease (v0.8.0) ────────────────────────────────────
+
+COMPARE_AND_SET_SCHEMA = {
+    "name": "muninn_compare_and_set",
+    "description": (
+        "Atomically transition a memory's lifecycle state only if it currently matches "
+        "an expected state (compare-and-set). Use to avoid clobbering concurrent transitions. "
+        "Returns whether it applied and the current state/owner on conflict."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "id": {"type": "string", "description": "ID of the memory to update."},
+            "expect_state": {
+                "type": "string",
+                "enum": ["planning", "active", "paused", "blocked", "completed", "cancelled", "archived"],
+                "description": "Only apply if the current state equals this. Omit to skip the guard.",
+            },
+            "set_state": {
+                "type": "string",
+                "enum": ["planning", "active", "paused", "blocked", "completed", "cancelled", "archived"],
+                "description": "The new lifecycle state to set when the guard holds.",
+            },
+        },
+        "required": ["id", "set_state"],
+    },
+}
+
+CLAIM_SCHEMA = {
+    "name": "muninn_claim",
+    "description": (
+        "Atomically claim an advisory ownership lease on a memory so a fleet of agents "
+        "can treat vault memories as a work queue and avoid double-processing. "
+        "Returns status: acquired, refreshed, reclaimed, or conflict."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "id": {"type": "string", "description": "ID of the memory to claim."},
+            "owner": {
+                "type": "string",
+                "description": "Stable holder identity, conventionally '{host}:{session}'.",
+            },
+            "ttl_secs": {
+                "type": "integer",
+                "description": "Lease duration in seconds. Goes stale after this without a refresh.",
+            },
+        },
+        "required": ["id", "owner", "ttl_secs"],
+    },
+}
+
+RELEASE_SCHEMA = {
+    "name": "muninn_release",
+    "description": (
+        "Release an ownership lease held by owner, making the memory immediately "
+        "visible to recall again. Idempotent: releasing an unleased memory is a no-op."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "id": {"type": "string", "description": "ID of the memory to release."},
+            "owner": {"type": "string", "description": "The holder identity used when claimed."},
+        },
+        "required": ["id", "owner"],
+    },
+}
+
 # ---------------------------------------------------------------------------
-# All schemas in order (original 3 + P0 6 + P1 15 + P2 9 = 33 tools)
+# All schemas — 42 tools matching MuninnDB MCP server v0.8.0
 # ---------------------------------------------------------------------------
 
 ALL_TOOL_SCHEMAS: List[Dict[str, Any]] = [
+    # Core (3)
     SEARCH_SCHEMA,
     REMEMBER_SCHEMA,
     ENTITIES_SCHEMA,
-    # P0
+    # P0 — Lifecycle (12)
     WHERE_LEFT_OFF_SCHEMA,
     FORGET_SCHEMA,
     EVOLVE_SCHEMA,
     REMEMBER_BATCH_SCHEMA,
     CONTRADICTIONS_SCHEMA,
     STATUS_SCHEMA,
-    # P1 — Knowledge graph
+    READ_SCHEMA,
+    CONSOLIDATE_SCHEMA,
+    RESTORE_SCHEMA,
+    LIST_DELETED_SCHEMA,
+    STATE_SCHEMA,
+    SESSION_SCHEMA,
+    # P1 — Knowledge graph (4)
     LINK_SCHEMA,
-    MERGE_SCHEMA,
     TRAVERSE_SCHEMA,
     DECIDE_SCHEMA,
-    # P1 — Entity management
-    FIND_ENTITY_SCHEMA,
-    ENTITY_SNAPSHOT_SCHEMA,
-    ENTITY_VERSIONS_SCHEMA,
+    EXPLAIN_SCHEMA,
+    # P1 — Entity management (8)
+    ENTITY_SCHEMA,
+    FIND_BY_ENTITY_SCHEMA,
+    ENTITY_STATE_SCHEMA,
+    ENTITY_STATE_BATCH_SCHEMA,
     ENTITY_CLUSTERS_SCHEMA,
+    ENTITY_TIMELINE_SCHEMA,
     SIMILAR_ENTITIES_SCHEMA,
     MERGE_ENTITY_SCHEMA,
-    ENTITY_STATE_SCHEMA,
-    FORGET_ENTITY_SCHEMA,
-    # P1 — Quality assurance
-    CLASSIFY_SCHEMA,
+    # P1 — Quality / Trust / Feedback (2)
     TRUST_SCHEMA,
     FEEDBACK_SCHEMA,
-    # P2 — Audit & debug
-    AUDIT_TRAIL_SCHEMA,
-    DEBUG_RECALL_SCHEMA,
-    VAULT_HEALTH_SCHEMA,
-    EXPORT_GRAPH_SCHEMA,
-    # P2 — Hierarchical memory
-    PARENT_SCHEMA,
-    CHILD_SCHEMA,
-    LEVEL_SCHEMA,
-    # P2 — Enrichment pipeline
+    # P1 — Enrichment (4)
     GET_ENRICHMENT_CANDIDATES_SCHEMA,
+    APPLY_ENRICHMENT_SCHEMA,
+    RETRY_ENRICH_SCHEMA,
     REPLAY_ENRICHMENT_SCHEMA,
+    # P2 — Audit / Export / Guide (3)
+    PROVENANCE_SCHEMA,
+    EXPORT_GRAPH_SCHEMA,
+    GUIDE_SCHEMA,
+    # P2 — Hierarchical memory (3)
+    REMEMBER_TREE_SCHEMA,
+    RECALL_TREE_SCHEMA,
+    ADD_CHILD_SCHEMA,
+    # P1 — Work-queue / lease (3, v0.8.0)
+    COMPARE_AND_SET_SCHEMA,
+    CLAIM_SCHEMA,
+    RELEASE_SCHEMA,
 ]
 
 
@@ -837,19 +1108,27 @@ def get_tool_schemas(priority_filter: str = "all") -> List[Dict[str, Any]]:
     Args:
         priority_filter: One of 'core', 'p0', 'p0-p1', 'p0-p2', 'all'.
             - 'core': 3 essential tools (search, remember, entities)
-            - 'p0': core + 6 P0 lifecycle tools = 9 tools
-            - 'p0-p1': core + P0 + 14 P1 tools = 23 tools
-            - 'all' or 'p0-p2': all 33 tools (default)
+            - 'p0': core + 12 P0 lifecycle tools = 15 tools
+            - 'p0-p1': core + P0 + 21 P1 tools = 36 tools
+            - 'all' or 'p0-p2': all 42 tools (default)
     """
-    # Tier membership defined by schema objects — ordering-independent
     _CORE = {id(SEARCH_SCHEMA), id(REMEMBER_SCHEMA), id(ENTITIES_SCHEMA)}
-    _P0 = {id(WHERE_LEFT_OFF_SCHEMA), id(FORGET_SCHEMA), id(EVOLVE_SCHEMA),
-            id(REMEMBER_BATCH_SCHEMA), id(CONTRADICTIONS_SCHEMA), id(STATUS_SCHEMA)}
-    _P1 = {id(LINK_SCHEMA), id(MERGE_SCHEMA), id(TRAVERSE_SCHEMA), id(DECIDE_SCHEMA),
-            id(FIND_ENTITY_SCHEMA), id(ENTITY_SNAPSHOT_SCHEMA), id(ENTITY_VERSIONS_SCHEMA),
-            id(ENTITY_CLUSTERS_SCHEMA), id(SIMILAR_ENTITIES_SCHEMA), id(MERGE_ENTITY_SCHEMA),
-            id(ENTITY_STATE_SCHEMA), id(FORGET_ENTITY_SCHEMA),
-            id(CLASSIFY_SCHEMA), id(TRUST_SCHEMA), id(FEEDBACK_SCHEMA)}
+    _P0 = {
+        id(WHERE_LEFT_OFF_SCHEMA), id(FORGET_SCHEMA), id(EVOLVE_SCHEMA),
+        id(REMEMBER_BATCH_SCHEMA), id(CONTRADICTIONS_SCHEMA), id(STATUS_SCHEMA),
+        id(READ_SCHEMA), id(CONSOLIDATE_SCHEMA), id(RESTORE_SCHEMA),
+        id(LIST_DELETED_SCHEMA), id(STATE_SCHEMA), id(SESSION_SCHEMA),
+    }
+    _P1 = {
+        id(LINK_SCHEMA), id(TRAVERSE_SCHEMA), id(DECIDE_SCHEMA), id(EXPLAIN_SCHEMA),
+        id(ENTITY_SCHEMA), id(FIND_BY_ENTITY_SCHEMA), id(ENTITY_STATE_SCHEMA),
+        id(ENTITY_STATE_BATCH_SCHEMA), id(ENTITY_CLUSTERS_SCHEMA),
+        id(ENTITY_TIMELINE_SCHEMA), id(SIMILAR_ENTITIES_SCHEMA), id(MERGE_ENTITY_SCHEMA),
+        id(TRUST_SCHEMA), id(FEEDBACK_SCHEMA),
+        id(GET_ENRICHMENT_CANDIDATES_SCHEMA), id(APPLY_ENRICHMENT_SCHEMA),
+        id(RETRY_ENRICH_SCHEMA), id(REPLAY_ENRICHMENT_SCHEMA),
+        id(COMPARE_AND_SET_SCHEMA), id(CLAIM_SCHEMA), id(RELEASE_SCHEMA),
+    }
     # P2 = everything else in ALL_TOOL_SCHEMAS not in CORE/P0/P1
 
     filter_sets = {
@@ -912,6 +1191,11 @@ def handle_tool_call(
                 "summary": args.get("summary", ""),
                 "vault": vault,
             }
+            # Pass through new fields if provided
+            for key in ("concept", "type_label", "tags", "confidence", "created_at",
+                        "entities", "relationships", "entity_relationships", "op_id", "embedding"):
+                if key in args:
+                    mcp_args[key] = args[key]
             result = client.call("muninn_remember", mcp_args)
             circuit.record_success()
             return json.dumps(result, default=str)

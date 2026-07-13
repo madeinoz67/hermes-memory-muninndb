@@ -359,7 +359,7 @@ class LifecycleHooks:
         """Merge similar observations stored this session to prevent noise accumulation.
 
         Runs at session boundary when enough observations were stored.
-        Uses muninn_merge to combine related observations into a single
+        Uses muninn_consolidate to combine related observations into a single
         consolidated memory, reducing vault noise over time.
         """
         if self._stored_obs_count < 3:
@@ -391,9 +391,9 @@ class LifecycleHooks:
                         summaries.append(s[:150])
                 consolidated = "Session synthesis: " + " | ".join(summaries)
 
-                self._client.call("muninn_merge", {
-                    "source_ids": obs_ids,
-                    "target_content": consolidated[:1000],
+                self._client.call("muninn_consolidate", {
+                    "ids": obs_ids,
+                    "merged_content": consolidated[:1000],
                     "vault": self._vault,
                 })
                 self._circuit.record_success()
