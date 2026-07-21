@@ -1,7 +1,7 @@
 """Tool schemas and unified dispatch for MuninnDB plugin.
 
 Synced against MuninnDB MCP server (muninndb/internal/mcp/tools.go)
-as of 2026-07-13 — 39 registered MCP tools.
+as of 2026-07-21 — 43 registered MCP tools.
 
 All tool calls flow through handle_tool_call() which:
 1. Checks circuit breaker
@@ -71,10 +71,12 @@ TOOL_NAME_MAP: Dict[str, str] = {
     "muninn_remember_tree": "muninn_remember_tree",
     "muninn_recall_tree": "muninn_recall_tree",
     "muninn_add_child": "muninn_add_child",
-    # P1 — Work-queue / lease (v0.8.0)
+    # P1 — Work-queue / lease
     "muninn_compare_and_set": "muninn_compare_and_set",
     "muninn_claim": "muninn_claim",
     "muninn_release": "muninn_release",
+    # P2 — Workflow vaults (v0.9.0)
+    "muninn_create_workflow_vault": "muninn_create_workflow_vault",
 }
 
 # ---------------------------------------------------------------------------
@@ -105,10 +107,68 @@ SEARCH_SCHEMA = {
         "properties": {
             "query": {"type": "string", "description": "What to search for."},
             "limit": {"type": "integer", "description": "Max results (default: 10)."},
+            "threshold": {"type": "number", "description": "Minimum relevance score 0.0-1.0 (default: 0.5)."},
             "mode": {
                 "type": "string",
                 "enum": ["semantic", "recent", "balanced", "deep"],
-                "description": "Recall mode (default: balanced).",
+                "description": (
+                    "Recall mode preset.\n"
+                    "• semantic  — high-precision vector search (threshold=0.3)\n"
+                    "• recent    — recency-biased, 1 hop (threshold=0.2)\n"
+                    "• balanced  — engine defaults (no override)\n"
+                    "• deep      — exhaustive graph traversal, 4 hops (threshold=0.1)"
+                ),
+            },
+            "profile": {
+                "type": "string",
+                "description": (
+                    "Traversal profile for BFS graph traversal. Leave unset for automatic inference.\n"
+                    "• default       — balanced retrieval across all edge types\n"
+                    "• causal        — follow cause/effect/dependency chains\n"
+                    "• confirmatory  — find supporting evidence; contradictions excluded\n"
+                    "• adversarial   — surface conflicts and contradictions\n"
+                    "• structural    — follow project/person/hierarchy edges"
+                ),
+            },
+            "since": {
+                "type": "string",
+                "description": "ISO 8601 timestamp (e.g. 2026-01-15T00:00:00Z). Only return memories created after this time.",
+            },
+            "before": {
+                "type": "string",
+                "description": "ISO 8601 timestamp (e.g. 2026-01-20T00:00:00Z). Only return memories created before this time.",
+            },
+            "tags_all": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Only return memories carrying ALL of these tags (exact match, AND).",
+            },
+            "tags_any": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Only return memories carrying AT LEAST ONE of these tags (exact match, OR).",
+            },
+            "tag_filter": {
+                "type": "object",
+                "description": "Filter by key:value tag convention via lexical comparison. Example: {\"prefix\":\"due:\",\"lte\":\"2026-06-17\"} matches memories tagged due:<date> where date <= 2026-06-17.",
+                "properties": {
+                    "prefix": {"type": "string", "description": "Tag key prefix to match, e.g. \"due:\" or \"status:\"."},
+                    "lte": {"type": "string", "description": "Value (after prefix) must be <= this."},
+                    "gte": {"type": "string", "description": "Value must be >= this."},
+                    "lt": {"type": "string", "description": "Value must be < this."},
+                    "gt": {"type": "string", "description": "Value must be > this."},
+                    "eq": {"type": "string", "description": "Value must equal this."},
+                },
+                "required": ["prefix"],
+            },
+            "embedding": {
+                "type": "array",
+                "items": {"type": "number"},
+                "description": "Optional pre-computed query embedding vector. Dimension must match vault's existing embedding dimension.",
+            },
+            "annotate": {
+                "type": "boolean",
+                "description": "When true, each result includes annotations with staleness, conflict, and supersession metadata. Default: false.",
             },
             "caller": {
                 "type": "string",
@@ -713,7 +773,8 @@ TRUST_SCHEMA = {
     "name": "muninn_trust",
     "description": (
         "Set the trust level of an engram. Levels: verified (human-confirmed), "
-        "inferred (AI-generated, default), external (imported), untrusted (unreliable)."
+        "inferred (AI-generated, default), external (imported), untrusted (unreliable). "
+        "Untrusted memories can be excluded from recall via ExcludeUntrusted in vault config."
     ),
     "parameters": {
         "type": "object",
@@ -724,6 +785,7 @@ TRUST_SCHEMA = {
                 "enum": ["verified", "inferred", "external", "untrusted"],
                 "description": "Trust level to assign.",
             },
+            "vault": {"type": "string", "description": "Vault containing the engram (default: \"default\")."},
         },
         "required": ["id", "trust"],
     },
@@ -1043,8 +1105,44 @@ RELEASE_SCHEMA = {
     },
 }
 
+# ── P2 — Workflow vaults (v0.9.0) ────────────────────────────────────────
+
+CREATE_WORKFLOW_VAULT_SCHEMA = {
+    "name": "muninn_create_workflow_vault",
+    "description": (
+        "Create a shared working vault for an agentic workflow and mint a scoped, "
+        "TTL'd capability token a worker agent can use to access it. The vault uses "
+        "the 'working' preset (default cognition + 7-day auto-evaporation) with "
+        "multi_user enabled. Requires a full-mode mk_ key and the MUNINN_AGENT_VAULT_CREATE "
+        "opt-in. The returned capability_secret is shown once — distribute it to worker "
+        "agents out-of-band. Recursion-safe: a capability cannot call this tool."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": (
+                    "Vault name (optional; auto-generates wf-<8hex> if omitted). "
+                    "MUST start with 'wf-' and be 1-64 lowercase alphanum/hyphen/underscore. "
+                    "Names lacking the wf- prefix are rejected (prevents cross-vault clobber)."
+                ),
+            },
+            "label": {
+                "type": "string",
+                "description": "Label stamped on the minted capability (for audit/listing). Default: 'agent-minted'.",
+            },
+            "ttl_hours": {
+                "type": "integer",
+                "description": "Capability lifetime in hours (1-168; default 168 = 7d, matching the working preset retention). Sub-hour values floor to 1; values above 168 clamp to 168.",
+            },
+        },
+        "required": [],
+    },
+}
+
 # ---------------------------------------------------------------------------
-# All schemas — 42 tools matching MuninnDB MCP server v0.8.0
+# All schemas — 43 tools matching MuninnDB MCP server v0.9.0
 # ---------------------------------------------------------------------------
 
 ALL_TOOL_SCHEMAS: List[Dict[str, Any]] = [
@@ -1099,6 +1197,8 @@ ALL_TOOL_SCHEMAS: List[Dict[str, Any]] = [
     COMPARE_AND_SET_SCHEMA,
     CLAIM_SCHEMA,
     RELEASE_SCHEMA,
+    # P2 — Workflow vaults (1, v0.9.0)
+    CREATE_WORKFLOW_VAULT_SCHEMA,
 ]
 
 
@@ -1110,7 +1210,7 @@ def get_tool_schemas(priority_filter: str = "all") -> List[Dict[str, Any]]:
             - 'core': 3 essential tools (search, remember, entities)
             - 'p0': core + 12 P0 lifecycle tools = 15 tools
             - 'p0-p1': core + P0 + 21 P1 tools = 36 tools
-            - 'all' or 'p0-p2': all 42 tools (default)
+            - 'all' or 'p0-p2': all 43 tools (default)
     """
     _CORE = {id(SEARCH_SCHEMA), id(REMEMBER_SCHEMA), id(ENTITIES_SCHEMA)}
     _P0 = {
