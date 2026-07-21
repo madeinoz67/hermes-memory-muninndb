@@ -4,7 +4,7 @@ Persistent semantic memory via MuninnDB knowledge graph with entity tracking,
 hierarchical organization, enrichment pipeline, work-queue leases, and
 automatic turn syncing via MCP streamable-http transport.
 
-**42 tools** synced with MuninnDB v0.8.0.
+**43 tools** synced with MuninnDB v0.9.0.
 
 ## Quick Install (for Hermes Agent)
 
@@ -23,7 +23,7 @@ print(f'MCP server returned {len(tools)} tools')
 "
 ```
 
-Expected: 42 tools. If 0 or connection refused, MuninnDB server needs starting.
+Expected: 43 tools. If 0 or connection refused, MuninnDB server needs starting.
 
 ### 2. Check plugin is in place
 
@@ -45,6 +45,8 @@ mcp_servers:
   muninndb:
     type: streamable-http            # ← REQUIRED — without this, 0 tools load
     url: http://MUNINNDB_HOST:8750/mcp
+    headers:
+      Authorization: Bearer mk_<your_key>  # ← Required for workflow vaults
 ```
 
 ### 4. Verify memory provider config
@@ -101,9 +103,10 @@ Common issues:
 - Hierarchical memory organization (tree storage + recall)
 - Enrichment pipeline for memory quality (entities, relationships, classification, summary)
 - Work-queue leases for multi-agent coordination (claim/compare-and-set/release)
+- **Workflow vaults** for shared multi-agent task contexts (`muninn_create_workflow_vault`)
 - Circuit breaker resilience for MCP failures
 - Session-aware with per-profile vault scoping
-- 42 tools synced with MuninnDB v0.8.0
+- 43 tools synced with MuninnDB v0.9.0
 
 ## Manual Installation (for Humans)
 
@@ -185,13 +188,27 @@ hermes restart
 | `tool_priority_filter` | Tool families: core/p0/p0-p1/all | `all` |
 | `enable_audit_tools` | Enable P2 audit/debug tools | `false` |
 
-### Optional Authentication
+### Authentication (Required for Workflow Vaults)
 
-```bash
-export MUNINNDB_MCP_TOKEN=your_token_here
+Workflow vaults require a full-mode `mk_` key. Configure in `config.yaml`:
+
+```yaml
+mcp_servers:
+  muninndb:
+    type: streamable-http
+    url: http://MUNINNDB_HOST:8750/mcp
+    headers:
+      Authorization: Bearer mk_<your_key>
 ```
 
-## Tool Reference (42 tools)
+Or via environment variable:
+```bash
+export MUNINNDB_MCP_TOKEN=mk_<your_key>
+```
+
+The MuninnDB server must have `MUNINN_AGENT_VAULT_CREATE=1` enabled for workflow vault creation.
+
+## Tool Reference (43 tools)
 
 ### Core Memory (3)
 
@@ -264,6 +281,12 @@ export MUNINNDB_MCP_TOKEN=your_token_here
 | `muninn_claim` | Claim ownership lease (acquired/refreshed/reclaimed/conflict) |
 | `muninn_release` | Release ownership lease (idempotent) |
 
+### P2 — Workflow Vaults (1) — v0.9.0
+
+| Tool | Purpose |
+|------|---------|
+| `muninn_create_workflow_vault` | Create shared `wf-*` vault with scoped capability token for multi-agent workflows |
+
 ### P2 — Audit / Export / Guide (3)
 
 | Tool | Purpose |
@@ -302,7 +325,7 @@ Use `tool_priority_filter` to control token overhead:
 - `core` — 3 essential tools
 - `p0` — Core + P0 lifecycle (15 tools)
 - `p0-p1` — Core + P0 + P1 (36 tools)
-- `all` — All 42 tools (default)
+- `all` — All 43 tools (default)
 
 ## Troubleshooting
 
