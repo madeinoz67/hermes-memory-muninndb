@@ -28,8 +28,10 @@ Expected: 43 tools. If 0 or connection refused, MuninnDB server needs starting.
 ### 2. Check plugin is in place
 
 ```bash
-ls -la /opt/data/plugins/memory/muninndb/__init__.py
+ls -la /opt/data/plugins/muninndb/__init__.py
 ```
+
+> **Install location:** The plugin must be at `$HERMES_HOME/plugins/muninndb/` (e.g. `/opt/data/plugins/muninndb/`). Hermes discovery scans `$HERMES_HOME/plugins/<name>/` — nesting it under a `memory/` subdirectory will NOT be detected.
 
 If missing, copy from the repo (see Development section).
 
@@ -113,10 +115,12 @@ Common issues:
 ### 1. Copy plugin files
 
 ```bash
-mkdir -p /opt/data/plugins/memory/muninndb
+mkdir -p /opt/data/plugins/muninndb
 cp __init__.py plugin.yaml config.py tools.py circuit_breaker.py mcp_client.py formatter.py lifecycle.py \
-   /opt/data/plugins/memory/muninndb/
+   /opt/data/plugins/muninndb/
 ```
+
+> **Important:** The plugin must be at `$HERMES_HOME/plugins/muninndb/`, NOT under a `memory/` subdirectory. Hermes discovery scans `$HERMES_HOME/plugins/<name>/` directly.
 
 ### 2. Configure connection
 
@@ -341,9 +345,11 @@ Use `tool_priority_filter` to control token overhead:
 ```bash
 git clone https://github.com/madeinoz67/hermes-memory-muninndb
 cd hermes-memory-muninndb
-ln -sf $(pwd) /opt/data/plugins/memory/muninndb
+ln -sf $(pwd) /opt/data/plugins/muninndb
 hermes restart
 ```
+
+> **Note:** The symlink target is `/opt/data/plugins/muninndb/` (not `/opt/data/plugins/memory/muninndb/`). The `memory/` subdirectory is not scanned by the plugin discovery code.
 
 ## License
 
