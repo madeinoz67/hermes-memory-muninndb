@@ -128,19 +128,36 @@ class MuninnDBMemoryProvider(MemoryProvider):
         # Resolve token (optional — MuninnDB may not require auth)
         token = os.environ.get("MUNINNDB_MCP_TOKEN", "").strip()
 
+        # Workflow vault override: kanban dispatcher injects these from
+        # task.metadata.workflow_vault when a task is part of a shared workflow.
+        # When set, the agent uses the ephemeral workflow vault instead of its
+        # profile-scoped vault, giving all agents in the workflow shared memory.
+        workflow_vault = os.environ.get("HERMES_KANBAN_WORKFLOW_VAULT", "").strip()
+        workflow_token = os.environ.get("HERMES_KANBAN_WORKFLOW_TOKEN", "").strip()
+
+        if workflow_vault:
+            # Workflow vault takes precedence — use ephemeral shared vault
+            self._vault = workflow_vault
+            if workflow_token:
+                token = workflow_token  # cap_ token scoped to this workflow
+            logger.info(
+                "MuninnDB: using workflow vault %s (ephemeral, shared across workflow)",
+                workflow_vault,
+            )
+        else:
+            # Standard vault: prefix + agent identity (profile-scoped)
+            vault_prefix = self._config.get("vault_prefix", "hermes")
+            if agent_identity and agent_identity != "default":
+                self._vault = f"{vault_prefix}_{agent_identity}"
+            else:
+                self._vault = vault_prefix
+
         # Apply config
         activate_limit = int(self._config.get("activate_limit", 10))
         activate_min_score = float(self._config.get("activate_min_score", 0.3))
         prefetch_tokens = int(self._config.get("prefetch_context_tokens", 800))
         trivial_min_words = int(self._config.get("trivial_message_min_words", 5))
         request_timeout = float(self._config.get("request_timeout_s", 15.0))
-
-        # Vault: prefix + agent identity (profile-scoped)
-        vault_prefix = self._config.get("vault_prefix", "hermes")
-        if agent_identity and agent_identity != "default":
-            self._vault = f"{vault_prefix}_{agent_identity}"
-        else:
-            self._vault = vault_prefix
 
         # Create client
         self._client = _MCPClient(mcp_url, timeout=request_timeout, token=token)
