@@ -1,5 +1,5 @@
 name: muninndb
-version: 0.12.0
+version: 0.11.0
 description: >
   MuninnDB — knowledge graph memory with semantic search, entity tracking,
   hierarchical organization, enrichment pipeline, work-queue leases,
