@@ -120,4 +120,9 @@ def get_config_schema() -> List[Dict[str, Any]]:
             "description": "Enable audit/debug tools (P2: audit_trail, debug_recall, vault_health, export_graph)",
             "default": False,
         },
+        {
+            "key": "workflow_vault_ttl_hours",
+            "description": "TTL in hours for auto-created workflow vaults (default: 72 = 3 days)",
+            "default": 72,
+        },
     ]

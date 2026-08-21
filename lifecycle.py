@@ -138,6 +138,12 @@ class LifecycleHooks:
         self._session_id = ""
         self._cross_vault_recall_fn = None
 
+        # Workflow vault state (set by provider when in kanban mode)
+        self._workflow_vault: str = ""  # ephemeral workflow vault name
+        self._main_vault: str = ""  # original profile vault (consolidation target)
+        self._workflow_client: MCPClient | None = None  # dedicated client with cap_ token
+        self._main_client: MCPClient | None = None  # main client with mk_ key (for consolidation)
+
         # Guide cache (lazy-fetched from muninn_guide on first use)
         self._guide_cache: str = ""
         self._guide_fetched: bool = False
@@ -147,6 +153,42 @@ class LifecycleHooks:
     def set_cross_vault_recall(self, fn):
         """Set the cross-vault recall function (from the provider)."""
         self._cross_vault_recall_fn = fn
+
+    # ── Workflow vault wiring ────────────────────────────────────────────
+
+    def set_workflow_vault(
+        self,
+        workflow_vault: str,
+        main_vault: str,
+        workflow_client: MCPClient | None = None,
+        main_client: MCPClient | None = None,
+    ) -> None:
+        """Configure workflow vault mode with dedicated MCP clients.
+
+        workflow_client: client with cap_ token for workflow vault operations.
+        main_client: client with mk_ key for consolidation to main vault.
+        self._client is redirected to workflow_client for all hooks.
+        """
+        self._workflow_vault = workflow_vault
+        self._main_vault = main_vault
+        self._workflow_client = workflow_client
+        self._main_client = main_client
+        self._vault = workflow_vault
+
+        # Redirect the active client to the workflow client
+        if workflow_client:
+            self._client = workflow_client
+            logger.debug("MuninnDB: switched to workflow client (cap_) for vault %s", workflow_vault)
+
+    def get_recall_vaults(self) -> list[str]:
+        """Return vaults to search: workflow vault (if active) + main vault."""
+        vaults = []
+        if self._workflow_vault:
+            vaults.append(self._workflow_vault)
+        main = self._main_vault or self._vault
+        if main not in vaults:
+            vaults.append(main)
+        return vaults or [self._vault]
 
     # ── System prompt ────────────────────────────────────────────────────
 
@@ -409,6 +451,7 @@ class LifecycleHooks:
         """Called at session boundary (/new, /reset, session expiry).
 
         Flushes remaining insights as a session summary memory.
+        In workflow mode, consolidates workflow vault to main vault.
         """
         if not self._client or self._circuit.is_open:
             return
@@ -434,9 +477,81 @@ class LifecycleHooks:
 
         # Consolidate observations stored this session to reduce noise
         self._consolidate_observations()
+
+        # Workflow vault → main vault consolidation
+        if self._workflow_vault and self._main_vault:
+            self._consolidate_workflow_to_main()
+
         self._stored_obs_count = 0
 
     # ── Memory write mirror ──────────────────────────────────────────────
+
+    def _consolidate_workflow_to_main(self) -> None:
+        """Consolidate workflow vault memories into the main vault.
+
+        Called at session end when in kanban workflow mode. Uses the
+        workflow client (cap_ token) to read from workflow vault, and the
+        main client (mk_ key) to write to main vault. No token switching
+        needed — each client has its own connection and auth.
+        """
+        if not self._workflow_client or not self._main_client or self._circuit is None:
+            return
+        if not self._workflow_vault or not self._main_vault:
+            return
+
+        try:
+            # Read from workflow vault using workflow client (cap_ token)
+            result = self._workflow_client.call("muninn_recall", {
+                "context": ["session workflow task results decisions"],
+                "limit": 50,
+                "threshold": 0.1,
+                "vault": self._workflow_vault,
+            })
+            self._circuit.record_success()
+
+            memories = (
+                result.get("memories")
+                or result.get("engrams")
+                or result.get("results")
+                or []
+            )
+
+            if not memories:
+                logger.debug("MuninnDB workflow vault empty, nothing to consolidate")
+                return
+
+            # Build consolidated summary
+            summaries = []
+            for m in memories[:20]:
+                content = m.get("content", "") or m.get("summary", "")
+                mem_type = m.get("type", "observation")
+                if content:
+                    summaries.append(f"[{mem_type}] {content[:200]}")
+
+            if not summaries:
+                return
+
+            consolidated = (
+                f"Workflow session (vault: {self._workflow_vault}):\n"
+                + "\n".join(summaries)
+            )
+
+            # Write to main vault using main client (mk_ key)
+            self._main_client.call("muninn_remember", {
+                "content": consolidated[:2000],
+                "type": "observation",
+                "summary": f"Workflow session from {self._workflow_vault}",
+                "vault": self._main_vault,
+            })
+            self._circuit.record_success()
+
+            logger.info(
+                "MuninnDB consolidated %d workflow memories from %s → %s",
+                len(memories), self._workflow_vault, self._main_vault,
+            )
+        except Exception as exc:
+            self._circuit.record_failure()
+            logger.debug("MuninnDB workflow consolidation failed: %s", exc)
 
     def on_memory_write(
         self,

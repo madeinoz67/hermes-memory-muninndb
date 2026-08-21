@@ -89,6 +89,14 @@ class MCPClient:
                     return {"text": text}
         return result
 
+    def set_token(self, token: str) -> None:
+        """Switch the auth token (e.g. mk_ → cap_ for workflow vault)."""
+        self._token = token
+        if token:
+            self._session.headers["Authorization"] = f"Bearer {token}"
+        elif "Authorization" in self._session.headers:
+            del self._session.headers["Authorization"]
+
     def close(self) -> None:
         """Close the underlying HTTP session and release connections."""
         self._session.close()

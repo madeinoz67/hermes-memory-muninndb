@@ -2,6 +2,23 @@
 
 All notable changes to the MuninnDB Hermes plugin are documented here.
 
+## [0.12.0] — 2026-08-21
+
+### Added
+
+- **Kanban workflow vault auto-detection** — Plugin automatically detects kanban task context via `HERMES_KANBAN_TASK` env var and creates a shared workflow vault. Sibling tasks (same parent) share the same vault for cross-task memory.
+- **Dual-client architecture** — Separate MCPClient instances for workflow vault (scoped `cap_` token) and main vault (`mk_` key). No token switching, fully concurrency-safe for parallel workflows.
+- **Workflow-to-main consolidation** — At session end, all workflow vault memories are consolidated into the main (profile) vault. Workflow vault auto-evaporates via TTL.
+- **Cross-vault recall** — Prefetch and recall search both workflow vault and main vault, merging results.
+- **`workflow_vault_ttl_hours` config option** — TTL for auto-created workflow vaults (default: 72h).
+- **`MCPClient.set_token()` method** — For programmatic token switching (utility, not used in main flow).
+
+### Changed
+
+- Cross-vault recall now routes through workflow-aware vault list when in kanban mode.
+- `LifecycleHooks` gains `set_workflow_vault()`, `get_recall_vaults()`, and `_consolidate_workflow_to_main()`.
+- Plugin docstring updated to reflect v0.11.0 sync and 44 tools.
+
 ## [0.9.0] — 2026-07-21
 
 ### Added

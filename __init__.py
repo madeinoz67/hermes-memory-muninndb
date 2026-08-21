@@ -11,10 +11,8 @@ Features:
 - Hierarchical memory organization
 - Enrichment pipeline for memory quality
 - Session-aware with vault scoping
-- 43 tools synced with MuninnDB MCP server v0.9.0 (2026-07-21):
-  3 core + 12 P0 lifecycle + 4 knowledge graph + 8 entity management
-  + 2 quality/trust + 4 enrichment + 3 audit/export/guide + 3 hierarchical
-  + 3 work-queue/lease + 1 workflow vaults
+- Kanban workflow vault auto-detection and consolidation
+- 44 tools synced with MuninnDB MCP server v0.11.0
 
 Config (muninndb.json in HERMES_HOME):
   mcp_url                   — MuninnDB MCP endpoint (required)
@@ -30,6 +28,7 @@ Config (muninndb.json in HERMES_HOME):
   skip_patterns_extra       — Additional user-extensible skip patterns
   tool_priority_filter      — Tool families to expose: all/p0/p0-p1/p0-p2 (default: all)
   enable_audit_tools        — Enable P2 audit/debug tools (default: false)
+  workflow_vault_ttl_hours  — TTL for auto-created workflow vaults (default: 72)
 """
 
 from __future__ import annotations
@@ -37,6 +36,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sqlite3
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -58,6 +58,30 @@ from .tools import handle_tool_call as _handle_tool_call
 logger = logging.getLogger(__name__)
 
 
+def _get_kanban_parent_task_id(task_id: str) -> str | None:
+    """Query the kanban DB to find the parent task ID for a given task.
+
+    Returns the parent task ID if one exists, None otherwise.
+    Uses HERMES_KANBAN_DB env var for the DB path.
+    """
+    db_path = os.environ.get("HERMES_KANBAN_DB", "")
+    if not db_path or not Path(db_path).exists():
+        return None
+    try:
+        conn = sqlite3.connect(db_path, timeout=5)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT parent_id FROM task_links WHERE child_id = ? LIMIT 1",
+            (task_id,),
+        )
+        row = cursor.fetchone()
+        conn.close()
+        return row[0] if row else None
+    except Exception as exc:
+        logger.debug("MuninnDB: failed to query kanban DB for parent: %s", exc)
+        return None
+
+
 class MuninnDBMemoryProvider(MemoryProvider):
     """MuninnDB knowledge graph memory — semantic recall, entity graph, auto-sync."""
 
@@ -69,6 +93,7 @@ class MuninnDBMemoryProvider(MemoryProvider):
         self._user_id = "default"
         self._hooks: LifecycleHooks | None = None
         self._config: dict = {}
+        self._main_vault: str = ""  # original profile vault (set when in workflow mode)
 
     # ── Core identity ──────────────────────────────────────────────────
 
@@ -126,31 +151,40 @@ class MuninnDBMemoryProvider(MemoryProvider):
             return
 
         # Resolve token (optional — MuninnDB may not require auth)
-        token = os.environ.get("MUNINNDB_MCP_TOKEN", "").strip()
+        mk_token = os.environ.get("MUNINNDB_MCP_TOKEN", "").strip()  # preserve original mk_ key
 
         # Workflow vault override: kanban dispatcher injects these from
         # task.metadata.workflow_vault when a task is part of a shared workflow.
         # When set, the agent uses the ephemeral workflow vault instead of its
         # profile-scoped vault, giving all agents in the workflow shared memory.
         workflow_vault = os.environ.get("HERMES_KANBAN_WORKFLOW_VAULT", "").strip()
-        workflow_token = os.environ.get("HERMES_KANBAN_WORKFLOW_TOKEN", "").strip()
+        workflow_cap_token = os.environ.get("HERMES_KANBAN_WORKFLOW_TOKEN", "").strip()
+
+        # Store the main (profile) vault before any workflow override
+        vault_prefix = self._config.get("vault_prefix", "hermes")
+        if agent_identity and agent_identity != "default":
+            main_vault = f"{vault_prefix}_{agent_identity}"
+        else:
+            main_vault = vault_prefix
 
         if workflow_vault:
-            # Workflow vault takes precedence — use ephemeral shared vault
+            # Explicit workflow vault from env (manual override)
             self._vault = workflow_vault
-            if workflow_token:
-                token = workflow_token  # cap_ token scoped to this workflow
             logger.info(
                 "MuninnDB: using workflow vault %s (ephemeral, shared across workflow)",
                 workflow_vault,
             )
         else:
-            # Standard vault: prefix + agent identity (profile-scoped)
-            vault_prefix = self._config.get("vault_prefix", "hermes")
-            if agent_identity and agent_identity != "default":
-                self._vault = f"{vault_prefix}_{agent_identity}"
-            else:
-                self._vault = vault_prefix
+            self._vault = main_vault
+
+        # Auto-detect kanban workflow context
+        kanban_task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+        if kanban_task_id and not workflow_vault:
+            workflow_vault, workflow_cap_token = self._auto_create_workflow_vault(
+                kanban_task_id, mk_token,
+            )
+            if workflow_vault:
+                self._vault = workflow_vault
 
         # Apply config
         activate_limit = int(self._config.get("activate_limit", 10))
@@ -159,8 +193,14 @@ class MuninnDBMemoryProvider(MemoryProvider):
         trivial_min_words = int(self._config.get("trivial_message_min_words", 5))
         request_timeout = float(self._config.get("request_timeout_s", 15.0))
 
-        # Create client
-        self._client = _MCPClient(mcp_url, timeout=request_timeout, token=token)
+        # Create clients — workflow mode gets two: cap_ for workflow, mk_ for main
+        if workflow_vault and workflow_cap_token:
+            self._client = _MCPClient(mcp_url, timeout=request_timeout, token=workflow_cap_token)
+            self._main_client = _MCPClient(mcp_url, timeout=request_timeout, token=mk_token)
+            logger.info("MuninnDB: dual-client mode — workflow (cap_) + main (mk_)")
+        else:
+            self._client = _MCPClient(mcp_url, timeout=request_timeout, token=mk_token)
+            self._main_client = None
 
         # Circuit breaker
         threshold = int(self._config.get("circuit_breaker_threshold", 5))
@@ -189,9 +229,18 @@ class MuninnDBMemoryProvider(MemoryProvider):
         self._hooks._session_id = session_id
         self._hooks.set_cross_vault_recall(self._cross_vault_recall)
 
+        # Wire up workflow vault if active
+        if workflow_vault:
+            self._hooks.set_workflow_vault(
+                workflow_vault, main_vault,
+                workflow_client=self._client,  # cap_ client
+                main_client=self._main_client,  # mk_ client
+            )
+            self._main_vault = main_vault
+
         logger.info(
-            "MuninnDB initialized: url=%s vault=%s limit=%d",
-            mcp_url, self._vault, activate_limit,
+            "MuninnDB initialized: url=%s vault=%s limit=%d workflow=%s",
+            mcp_url, self._vault, activate_limit, bool(workflow_vault),
         )
 
     def system_prompt_block(self) -> str:
@@ -204,20 +253,75 @@ class MuninnDBMemoryProvider(MemoryProvider):
             self._hooks.shutdown()
         if self._client:
             self._client.close()
+        if self._main_client:
+            self._main_client.close()
         self._client = None
+        self._main_client = None
 
     # ── Cross-vault helpers ────────────────────────────────────────────
 
     def _get_cross_vaults(self) -> list[str]:
-        """Return vaults to search: profile vault + base vault if different."""
+        """Return vaults to search: workflow vault + main vault (if in workflow mode),
+        or profile vault + base vault (normal mode)."""
+        # In workflow mode, use hooks' vault list
+        if self._hooks and self._hooks._workflow_vault:
+            return self._hooks.get_recall_vaults()
+        # Normal mode: profile vault + base vault
         vaults = [self._vault]
         base = self._vault.split("_")[0] if "_" in self._vault else ""
         if base and base != self._vault:
             vaults.append(base)
         return vaults
 
+    # ── Workflow vault auto-creation ────────────────────────────────────
+
+    def _auto_create_workflow_vault(
+        self, task_id: str, mk_token: str,
+    ) -> tuple[str, str]:
+        """Auto-create a workflow vault for a kanban task.
+
+        Derives the vault name from the parent task ID (so sibling tasks
+        share a vault). If no parent, uses the task's own ID.
+
+        Returns (vault_name, capability_token) or ("", "") on failure.
+        """
+        if not self._client or not self._circuit:
+            return "", ""
+
+        # Find workflow root: parent task if exists, else this task
+        parent_id = _get_kanban_parent_task_id(task_id)
+        workflow_id = parent_id or task_id
+
+        # Sanitize for vault name (wf- prefix required by MuninnDB)
+        safe_id = workflow_id.replace("/", "-").replace("\\", "-")[:32]
+        vault_name = f"wf-{safe_id}"
+
+        ttl_hours = int(self._config.get("workflow_vault_ttl_hours", 72))
+
+        try:
+            result = self._client.call("muninn_create_workflow_vault", {
+                "name": vault_name,
+                "label": f"kanban:{task_id}",
+                "ttl_hours": ttl_hours,
+            })
+            self._circuit.record_success()
+
+            cap_secret = result.get("capability_secret", "")
+            actual_name = result.get("name", vault_name)
+
+            logger.info(
+                "MuninnDB: auto-created workflow vault %s for task %s (parent=%s, ttl=%dh)",
+                actual_name, task_id, parent_id, ttl_hours,
+            )
+            return actual_name, cap_secret
+
+        except Exception as exc:
+            self._circuit.record_failure()
+            logger.warning("MuninnDB: failed to create workflow vault: %s", exc)
+            return "", ""
+
     def _cross_vault_recall(self, query: str, limit: int = 0, threshold: float = 0.0) -> dict:
-        """Search across profile vault + base vault, merge and deduplicate results."""
+        """Search across workflow + main vaults (workflow mode) or profile + base vaults (normal mode)."""
         if not self._client or not self._circuit:
             return {"memories": [], "total": 0}
 
