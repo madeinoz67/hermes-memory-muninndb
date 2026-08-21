@@ -2,7 +2,7 @@
 
 All notable changes to the MuninnDB Hermes plugin are documented here.
 
-## [0.12.0] — 2026-08-21
+## [0.11.0] — 2026-08-21
 
 ### Added
 
@@ -18,6 +18,13 @@ All notable changes to the MuninnDB Hermes plugin are documented here.
 - Cross-vault recall now routes through workflow-aware vault list when in kanban mode.
 - `LifecycleHooks` gains `set_workflow_vault()`, `get_recall_vaults()`, and `_consolidate_workflow_to_main()`.
 - Plugin docstring updated to reflect v0.11.0 sync and 44 tools.
+
+## [0.10.0] — 2026-07-28
+
+### Changed
+
+- Tool count: 43 → 44 (matches MuninnDB MCP server v0.10.0).
+- Synced tool schemas with MuninnDB v0.10.0 server.
 
 ## [0.9.0] — 2026-07-21
 
